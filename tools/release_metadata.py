@@ -24,8 +24,10 @@ def resolve(version, changelog, event, ref, subject, requested="", dry_run=True)
         publish = not dry_run
     if not re.fullmatch(r"\d+\.\d+\.\d+", candidate) or candidate != version:
         raise ValueError("Requested/tag version must equal CMake BASE_VERSION")
-    if publish and f"## [{version}]" not in changelog:
-        raise ValueError("Release requires a versioned changelog entry")
+    if publish or event == "workflow_dispatch":
+        section = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)", changelog, re.M | re.S)
+        if not section or not section[1].strip():
+            raise ValueError("Release requires a nonempty versioned changelog entry")
     return candidate, publish
 
 
@@ -36,5 +38,6 @@ if __name__ == "__main__":
     version, publish = resolve(version, changelog, os.environ["GITHUB_EVENT_NAME"],
                                os.environ["GITHUB_REF"], subject, os.getenv("INPUT_VERSION", ""),
                                os.getenv("INPUT_DRY_RUN", "true") == "true")
+    release_build = publish or os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-        output.write(f"version={version}\npublish={str(publish).lower()}\n")
+        output.write(f"version={version}\npublish={str(publish).lower()}\nrelease_build={int(release_build)}\n")

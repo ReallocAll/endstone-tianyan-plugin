@@ -1,6 +1,16 @@
 name: Build and Release
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Prepared version'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Build and validate without publishing'
+        type: boolean
+        default: true
   push:
     branches:
       - master
@@ -32,6 +42,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       publish: ${{ steps.meta.outputs.publish }}
+      release_build: ${{ steps.meta.outputs.release_build }}
     steps:
       - uses: actions/checkout@v6
       - name: Validate release metadata
@@ -91,7 +102,7 @@ jobs:
       - name: Configure CMake (Linux)
         if: runner.os == 'Linux'
         run: |
-          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=1 \
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=${{ needs.prepare.outputs.release_build }} \
                 -DCMAKE_C_COMPILER=clang-19 \
                 -DCMAKE_CXX_COMPILER=clang++-19 \
                 -DCMAKE_CXX_FLAGS="-stdlib=libc++"
@@ -125,7 +136,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=1 `
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=${{ needs.prepare.outputs.release_build }} `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake" `
@@ -159,6 +170,19 @@ jobs:
           cd package
           Compress-Archive -Path endstone_tianyan.dll, tianyan_data -DestinationPath ../tianyan_nightly_windows.zip
 
+      - name: Record resolved native dependencies
+        shell: bash
+        run: |
+          {
+            printf 'Plugin source: %s\n' "$GITHUB_SHA"
+            rustc --version
+            cmake --version | head -1
+            find build -name .git -prune -print | sort | while read -r metadata; do
+              repository="$(dirname "$metadata")"
+              printf '%s %s\n' "$repository" "$(git -C "$repository" rev-parse HEAD)"
+            done
+            sha256sum rust_mysql/Cargo.lock WebUI-Next/pnpm-lock.yaml
+          } > dependency-manifest-${{ runner.os }}.txt
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -167,6 +191,7 @@ jobs:
             tianyan_nightly_*.zip
             build/endstone_tianyan.so
             build/endstone_tianyan.dll
+            dependency-manifest-*.txt
           retention-days: 1
 
 
@@ -192,6 +217,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release
+          cp artifacts/dependency-manifest-*.txt release/
           cp artifacts/build/endstone_tianyan.so release/
           cp artifacts/build/endstone_tianyan.dll release/
           cp artifacts/tianyan_nightly_linux.zip "release/tianyan-$VERSION-linux.zip"
