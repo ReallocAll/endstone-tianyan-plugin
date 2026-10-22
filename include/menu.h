@@ -4,6 +4,7 @@
 
 #ifndef TIANYAN_COMMANDS_H
 #define TIANYAN_COMMANDS_H
+#include "world_inspector.h"
 #include "global.h"
 #include <endstone/endstone.hpp>
 #include <array>
@@ -44,7 +45,7 @@ public:
 
     //离线玩家可视化物品栏展示（从 world-inspector 编码数据），失败返回 false
     bool showOfflinePlayerInventoryEncoded(endstone::Player &sender, const std::string& player_name,
-        const std::string& world_path, const std::string& player_uuid);
+        const WiEncodedInventory* encoded);
 
     //查找实体密度高区域
     void findHighDensityRegion(endstone::Player &player, int size = 20) const;

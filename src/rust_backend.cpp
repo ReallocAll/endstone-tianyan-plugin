@@ -1,6 +1,7 @@
 #include "rust_backend.h"
 
-#include "database.hpp"
+#include <memory>
+#include <algorithm>
 
 #include <chrono>
 #include <iostream>
@@ -39,6 +40,15 @@ extern "C" {
                                        const char* const* params,
                                        int32_t param_count);
 
+    struct RustBatchStatement {
+        const char* sql;
+        const char* const* params;
+        int32_t param_count;
+    };
+    int64_t rust_mysql_execute_batch(void* handle,
+                                    const RustBatchStatement* statements,
+                                    int32_t count);
+
     // Result access
     int32_t rust_mysql_result_rows(const void* result);
     int32_t rust_mysql_result_cols(const void* result);
@@ -48,9 +58,26 @@ extern "C" {
     void rust_mysql_free_result(void* result);
 
     // Error & utility
-    const char* rust_mysql_last_error(const void* handle);
+    char* rust_mysql_last_error(const void* handle);
     char* rust_mysql_generate_uuid();
     void rust_mysql_free_string(char* s);
+}
+
+// All storage is complete before exposing pointers to Rust. The Rust call owns
+// one pooled connection/transaction for the entire batch, including commit.
+static int64_t execute_batch(void* handle,
+                             const std::vector<std::string>& sql,
+                             const std::vector<std::vector<std::string>>& params) {
+    std::vector<std::vector<const char*>> raw_params(params.size());
+    std::vector<RustBatchStatement> statements;
+    statements.reserve(sql.size());
+    for (size_t i = 0; i < sql.size(); ++i) {
+        for (const auto& value : params[i]) raw_params[i].push_back(value.c_str());
+        statements.push_back({sql[i].c_str(), raw_params[i].data(),
+                              static_cast<int32_t>(raw_params[i].size())});
+    }
+    return rust_mysql_execute_batch(handle, statements.data(),
+                                    static_cast<int32_t>(statements.size()));
 }
 
 // ============================================================
@@ -98,8 +125,9 @@ RustBackend::~RustBackend() {
 
 std::string RustBackend::lastError() const {
     if (!handle_) return "null handle";
-    const char* err = rust_mysql_last_error(handle_);
-    return err ? std::string(err) : "";
+    const std::unique_ptr<char, decltype(&rust_mysql_free_string)> err(
+        rust_mysql_last_error(handle_), &rust_mysql_free_string);
+    return err ? std::string(err.get()) : "";
 }
 
 // ============================================================
@@ -334,14 +362,12 @@ int RustBackend::addLogs(const std::vector<DatabaseLogEntry>& entries) {
     if (entries.empty()) return 0;
     if (!handle_) return -1;
 
-    // Multi-row INSERT: one FFI call per 5000 rows instead of per-row
+    // Bound each statement below the protocol parameter limit; commit all
+    // statements together on one pooled connection.
     constexpr int SUB_BATCH = 4000; // 4000 × 13 = 52000 params, well under MySQL limit
 
-    // bulk insert 优化：跳过唯一约束检查，redo log 降频
-    rust_mysql_execute(handle_,
-        "SET SESSION unique_checks=0, foreign_key_checks=0, "
-        "innodb_flush_log_at_trx_commit=2");
-    rust_mysql_execute(handle_, "START TRANSACTION");
+    std::vector<std::string> statements;
+    std::vector<std::vector<std::string>> batch_params;
 
     for (size_t i = 0; i < entries.size(); i += SUB_BATCH) {
         constexpr int COLS = 13;
@@ -374,29 +400,10 @@ int RustBackend::addLogs(const std::vector<DatabaseLogEntry>& entries) {
             params.emplace_back(status);
         }
 
-        std::vector<const char*> c_params;
-        c_params.reserve(params.size());
-        for (const auto& p : params) {
-            c_params.push_back(p.c_str());
-        }
-
-        if (rust_mysql_execute_params(handle_, sql.c_str(),
-                                       c_params.data(),
-                                       static_cast<int32_t>(c_params.size())) < 0) {
-            rust_mysql_execute(handle_,
-                "SET SESSION unique_checks=1, foreign_key_checks=1, "
-                "innodb_flush_log_at_trx_commit=1");
-            rust_mysql_execute(handle_, "ROLLBACK");
-            return -1;
-        }
+        statements.push_back(std::move(sql));
+        batch_params.push_back(std::move(params));
     }
-
-    rust_mysql_execute(handle_, "COMMIT");
-    // 恢复 session 变量
-    rust_mysql_execute(handle_,
-        "SET SESSION unique_checks=1, foreign_key_checks=1, "
-        "innodb_flush_log_at_trx_commit=1");
-    return 0;
+    return execute_batch(handle_, statements, batch_params) >= 0 ? 0 : -1;
 }
 
 int RustBackend::searchLog(
@@ -468,21 +475,15 @@ bool RustBackend::updateStatusesByUUIDs(
     if (pairs.empty()) return true;
     if (!handle_) return false;
 
-    rust_mysql_execute(handle_, "START TRANSACTION");
-
+    std::vector<std::string> statements;
+    std::vector<std::vector<std::string>> params;
+    statements.reserve(pairs.size());
+    params.reserve(pairs.size());
     for (const auto& [uuid, status] : pairs) {
-        std::vector c_params = {status.c_str(), uuid.c_str()};
-        if (rust_mysql_execute_params(
-                handle_,
-                "UPDATE LOGDATA SET status = ? WHERE uuid = ?",
-                c_params.data(), 2) < 0) {
-            rust_mysql_execute(handle_, "ROLLBACK");
-            return false;
-        }
+        statements.emplace_back("UPDATE LOGDATA SET status = ? WHERE uuid = ?");
+        params.push_back({status, uuid});
     }
-
-    rust_mysql_execute(handle_, "COMMIT");
-    return true;
+    return execute_batch(handle_, statements, params) >= 0;
 }
 
 int64_t RustBackend::getCleanCount(const long long timestamp) {
@@ -556,10 +557,6 @@ int64_t RustBackend::cleanupByRebuild(const long long threshold) {
         return -1;
     }
 
-    // Step 2: bulk insert 优化
-    rust_mysql_execute(handle_,
-        "SET SESSION unique_checks=0, foreign_key_checks=0, "
-        "innodb_flush_log_at_trx_commit=2");
 
     // Step 3: INSERT SELECT 保留需要的数据（含 id_pk 保持 auto_increment 连续）
     const std::string insert_sql =
@@ -573,9 +570,6 @@ int64_t RustBackend::cleanupByRebuild(const long long threshold) {
     const int64_t kept = rust_mysql_execute(handle_, insert_sql.c_str());
     if (kept < 0) {
         std::cerr << "[Tianyan][RustMySQL] rebuild: INSERT SELECT failed" << std::endl;
-        rust_mysql_execute(handle_,
-            "SET SESSION unique_checks=1, foreign_key_checks=1, "
-            "innodb_flush_log_at_trx_commit=1");
         rust_mysql_execute(handle_, "DROP TABLE IF EXISTS LOGDATA_NEW");
         return -1;
     }
@@ -587,17 +581,10 @@ int64_t RustBackend::cleanupByRebuild(const long long threshold) {
             "ADD KEY idx_logdata_time (time), "
             "ADD KEY idx_logdata_pos (pos_x, pos_y, pos_z)") < 0) {
         std::cerr << "[Tianyan][RustMySQL] rebuild: add index failed" << std::endl;
-        rust_mysql_execute(handle_,
-            "SET SESSION unique_checks=1, foreign_key_checks=1, "
-            "innodb_flush_log_at_trx_commit=1");
         rust_mysql_execute(handle_, "DROP TABLE IF EXISTS LOGDATA_NEW");
         return -1;
     }
 
-    // 恢复 session 变量
-    rust_mysql_execute(handle_,
-        "SET SESSION unique_checks=1, foreign_key_checks=1, "
-        "innodb_flush_log_at_trx_commit=1");
 
     // Step 5: 原子交换表名（DDL，< 1ms）
     if (rust_mysql_execute(handle_,

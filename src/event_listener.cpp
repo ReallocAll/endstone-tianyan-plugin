@@ -603,6 +603,9 @@ void EventListener::onPlayerJoin(const endstone::PlayerJoinEvent &event) {
 void EventListener::onPlayerLeave(const endstone::PlayerQuitEvent& event)
 {
     online_players_.erase(&event.getPlayer());
+    plugin_.invalidateSession(event.getPlayer().getName());
+    TianyanCore::playerMessageTimes.erase(event.getPlayer().getName());
+    TianyanCore::playerCommandTimes.erase(event.getPlayer().getName());
 }
 
 
@@ -618,7 +621,7 @@ void EventListener::onPlayerSendMSG(const endstone::PlayerChatEvent &event) {
 }
 
 //大量命令刷屏检测
-void EventListener::onPlayerSendCMD(const endstone::PlayerChatEvent &event) {
+void EventListener::onPlayerSendCMD(const endstone::PlayerCommandEvent &event) {
     TianyanCore::recordPlayerSendCMD(event.getPlayer().getName());
     if (TianyanCore::checkPlayerSendCMD(event.getPlayer().getName())) {
         string reason = tran_->getLocal("Too many commands sent in a short time");

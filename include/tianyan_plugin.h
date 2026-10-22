@@ -13,6 +13,10 @@
 #include "menu.h"
 #include "translate.hpp"
 #include "offline_inventory.h"
+#include "owned_work_queue.h"
+#include "revert_guard.h"
+#include "world_inspector.h"
+#include <unordered_set>
 #include <tianyan/api.h>
 
 // WebUI 后端
@@ -26,6 +30,7 @@ public:
 
 class TianyanPlugin : public endstone::Plugin, public tianyan::ITianyanAPI{
 public:
+    void invalidateSession(const std::string& name) { ++sessions_[name]; }
     //语言
     static inline std::unique_ptr<translate> Tran;
     //数据目录和配置文件检查
@@ -75,13 +80,15 @@ public:
 private:
     std::vector<tianyan::LogData> getLogDataSyncImpl(double seconds, int limit) override;
     struct AsyncOfflineQueryTask {
+        uint64_t id = 0;
+        uint64_t session = 0;
         std::string sender_name;     // 命令发送者（在线玩家，用于回传 UI）
         std::string target_name;     // 被查询的离线玩家（用于显示）
         std::string world_path;
         std::string player_uuid;
         bool is_running = false;
         bool is_complete = false;
-        std::string result_json;
+        std::shared_ptr<WiEncodedInventory> encoded;
     };
 
     struct AsyncQueryTask {
@@ -89,9 +96,14 @@ private:
         Type type;
         uint64_t id = 0;
         std::string player_name;
+        uint64_t session = 0;
+        size_t cursor = 0;
+        int successes = 0, failures = 0;
+        std::unordered_set<std::string> placed_positions;
         bool is_running = false;
         bool is_complete = false;
         bool cancelled = false;
+        std::string error;
         std::shared_ptr<std::atomic<bool>> cancel_flag;
         std::vector<TianyanCore::LogData> results;
 
@@ -103,6 +115,18 @@ private:
         std::string key;
     };
 
+    std::unordered_map<std::string, uint64_t> sessions_;
+    mutable RevertGuard reverted_;
+    mutable std::recursive_mutex backend_mutex_;
+    bool recovery_loaded_ = false;
+    void submitWork(std::function<void()> task) const;
+    void submitQueryWork(uint64_t id, std::function<void()> task);
+    void submitOfflineWork(uint64_t id, std::function<void()> task);
+    std::atomic<bool> stopping_{false};
+    void flushAcceptedLogs() const;
+    void flushRevertStatuses() const;
+    void savePendingWrites() const;
+    void restorePendingWrites();
     //初始化其它实例
     std::unique_ptr<IDatabaseBackend> db_backend_;
     std::unique_ptr<TianyanCore> tyCore;
@@ -127,4 +151,6 @@ private:
     void default_init_sqlite_();
     void checkMigrateStatus();
     void runMigration(const std::string& source, const std::string& target, const std::string& sender_name) const;
+    mutable OwnedWorkQueue workers_;
+
 };

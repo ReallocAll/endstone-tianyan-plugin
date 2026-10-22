@@ -1,0 +1,39 @@
+name: Ownership regression tests
+on:
+  workflow_call:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: tianyan_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -ptest"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+    steps:
+      - uses: actions/checkout@v6
+      - name: Release metadata tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Native ownership tests
+        run: |
+          c++ -std=c++20 -pthread -Iinclude tests/owned_work_queue_test.cpp -o /tmp/ownership-test
+          /tmp/ownership-test
+          sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+          c++ -std=c++20 -pthread -Iinclude tests/sqlite_pool_test.cpp -lsqlite3 -o /tmp/sqlite-pool-test
+          /tmp/sqlite-pool-test
+      - name: Rust unit tests
+        working-directory: rust_mysql
+        run: cargo test --locked
+      - name: MySQL transaction integration
+        working-directory: rust_mysql
+        env:
+          TIANYAN_MYSQL_TEST_URL: mysql://root:test@127.0.0.1:3306/tianyan_test
+        run: cargo test --locked -- --ignored

@@ -22,7 +22,7 @@ struct WebUIConfig {
     std::string secret = "your_secret";
     uint16_t port = 8098;
     bool debug = false;
-    std::string host = "0.0.0.0";
+    std::string host = "127.0.0.1";
 
     /// 静态资源策略：
     ///   空字符串 → 从 CMake 编译的嵌入式字节数组提供（默认，单文件分发）

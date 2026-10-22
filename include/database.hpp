@@ -75,25 +75,34 @@ namespace yuhangle {
             if (connections.empty() && current_size < pool_size) {
                 if (auto conn = createConnection()) {
                     current_size++;
-                    return conn;
+                    lock.unlock();
+                    return makeLease(std::move(conn));
                 }
             }
 
-            // 等待可用连接
-            condition.wait(lock, [this]() { return !connections.empty(); });
+            if (current_size == 0) throw std::runtime_error("Unable to open SQLite connection");
+            if (!condition.wait_for(lock, std::chrono::seconds(10), [this]() { return !connections.empty(); }))
+                throw std::runtime_error("Timed out acquiring SQLite connection");
 
             auto conn = connections.front();
             connections.pop();
-            return conn;
-        }
-
-        void returnConnection(const std::shared_ptr<DatabaseConnection>& conn) {
-            std::lock_guard lock(pool_mutex);
-            connections.push(conn);
-            condition.notify_one();
+            lock.unlock();
+            return makeLease(std::move(conn));
         }
 
     private:
+        std::shared_ptr<DatabaseConnection> makeLease(std::shared_ptr<DatabaseConnection> connection) {
+            auto* raw = connection.get();
+            return std::shared_ptr<DatabaseConnection>(raw, [this, connection = std::move(connection)](DatabaseConnection*) {
+                // Failed preparation/commit must not return an open transaction.
+                if (!sqlite3_get_autocommit(connection->get()))
+                    sqlite3_exec(connection->get(), "ROLLBACK", nullptr, nullptr, nullptr);
+                std::lock_guard lock(pool_mutex);
+                connections.push(connection);
+                condition.notify_one();
+            });
+        }
+
         void initializePool() {
             for (size_t i = 0; i < pool_size; ++i) {
                 if (auto conn = createConnection()) {
@@ -169,7 +178,6 @@ namespace yuhangle {
             // 复合索引：强制走 index cursor，避免全表扫描回退
             sqlite3_exec(conn->get(), "CREATE INDEX IF NOT EXISTS idx_logdata_time_rowid ON LOGDATA(time, rowid)", nullptr, nullptr, nullptr);
 
-            pool.returnConnection(conn);
             return SQLITE_OK;
         }
 
@@ -185,7 +193,6 @@ namespace yuhangle {
                 std::cerr << "SQL 执行失败: " << sqlite3_errmsg(conn->get()) << std::endl;
             }
 
-            pool.returnConnection(conn);
             return rc;
         }
 
@@ -209,7 +216,6 @@ namespace yuhangle {
                 std::cerr << "SQL 查询失败: " << sqlite3_errmsg(conn->get()) << std::endl;
             }
 
-            pool.returnConnection(conn);
             return rc;
         }
 
@@ -224,7 +230,6 @@ namespace yuhangle {
                 std::cerr << "SQL 更新失败: " << sqlite3_errmsg(conn->get()) << std::endl;
             }
 
-            pool.returnConnection(conn);
             return rc;
         }
 
@@ -239,7 +244,7 @@ namespace yuhangle {
             if (const int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr); rc != SQLITE_OK) {
                 std::cerr << "getCleanCount prepare failed: " << sqlite3_errmsg(db) << std::endl;
                 sqlite3_finalize(stmt);
-                pool.returnConnection(conn);
+
                 return -1;
             }
 
@@ -251,7 +256,7 @@ namespace yuhangle {
             }
 
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return count;
         }
 
@@ -279,7 +284,7 @@ namespace yuhangle {
             if (rc != SQLITE_OK) {
                 std::cerr << "deleteBatch prepare failed: " << sqlite3_errmsg(db) << std::endl;
                 sqlite3_finalize(stmt);
-                pool.returnConnection(conn);
+
                 return -1;
             }
 
@@ -290,14 +295,13 @@ namespace yuhangle {
             if (rc != SQLITE_DONE) {
                 std::cerr << "deleteBatch step failed: " << sqlite3_errmsg(db) << std::endl;
                 sqlite3_finalize(stmt);
-                pool.returnConnection(conn);
+
                 return -1;
             }
 
             const int deleted = sqlite3_changes(db);
             sqlite3_finalize(stmt);
 
-            pool.returnConnection(conn);
             return deleted;
         }
 
@@ -327,7 +331,7 @@ namespace yuhangle {
 
             // 清理资源
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return exists;
         }
 
@@ -366,7 +370,7 @@ namespace yuhangle {
 
             // 清理资源
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return true;
         }
 
@@ -399,7 +403,7 @@ namespace yuhangle {
 
             // 清理资源
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return true;
         }
 
@@ -417,7 +421,7 @@ namespace yuhangle {
             int rc = sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
             if (rc != SQLITE_OK) {
                 std::cerr << "无法开始事务: " << sqlite3_errmsg(db) << std::endl;
-                pool.returnConnection(conn);
+
                 return false;
             }
 
@@ -427,7 +431,7 @@ namespace yuhangle {
             rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
             if (rc != SQLITE_OK) {
                 std::cerr << "SQL 预处理失败: " << sqlite3_errmsg(db) << std::endl;
-                pool.returnConnection(conn);
+
                 return false;
             }
 
@@ -443,7 +447,7 @@ namespace yuhangle {
                     std::cerr << "SQL 更新失败: " << sqlite3_errmsg(db) << std::endl;
                     sqlite3_finalize(stmt);
                     sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
-                    pool.returnConnection(conn);
+
                     return false;
                 }
 
@@ -460,8 +464,8 @@ namespace yuhangle {
 
             // 清理资源
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
-            return true;
+
+            return rc == SQLITE_OK;
         }
 
         ///////////////////// LOGDATA 表操作 /////////////////////
@@ -518,7 +522,7 @@ namespace yuhangle {
 
             // 清理资源
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return SQLITE_OK;
         }
 
@@ -593,7 +597,7 @@ namespace yuhangle {
 
             // 清理资源
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return rc;
         }
 
@@ -673,7 +677,7 @@ namespace yuhangle {
             if (rc == SQLITE_ABORT) {
                 std::cerr << "SQL 查询被取消" << std::endl;
                 sqlite3_finalize(stmt);
-                pool.returnConnection(conn);
+
                 return rc;
             }
 
@@ -682,7 +686,7 @@ namespace yuhangle {
             }
 
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return rc == SQLITE_DONE ? SQLITE_OK : rc;
         }
 
@@ -773,7 +777,7 @@ namespace yuhangle {
             if (rc == SQLITE_ABORT) {
                 std::cerr << "SQL 查询被取消" << std::endl;
                 sqlite3_finalize(stmt);
-                pool.returnConnection(conn);
+
                 return rc;
             }
 
@@ -782,7 +786,7 @@ namespace yuhangle {
             }
 
             sqlite3_finalize(stmt);
-            pool.returnConnection(conn);
+
             return rc == SQLITE_DONE ? SQLITE_OK : rc;
         }
 

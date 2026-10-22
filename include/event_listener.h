@@ -74,13 +74,13 @@ public:
     void onPlayerSendMSG(const endstone::PlayerChatEvent &event);
 
     //大量命令刷屏检测
-    void onPlayerSendCMD(const endstone::PlayerChatEvent &event);
+    void onPlayerSendCMD(const endstone::PlayerCommandEvent &event);
 
     //拒绝封禁玩家加入
     void onPlayerTryJoin(const endstone::PlayerLoginEvent &event);
 
 private:
-    endstone::Plugin &plugin_;
+    TianyanPlugin &plugin_;
     translate* tran_;
     std::unordered_set<const endstone::Player*> online_players_;
 };

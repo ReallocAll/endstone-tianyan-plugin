@@ -425,6 +425,11 @@ void TianyanPlugin::onLoad()
 void TianyanPlugin::onEnable()
 {
     getLogger().info("onEnable is called");
+    workers_.start();
+    yuhangle::migrate_status = 0;
+    yuhangle::clean_data_status = 0;
+    stopping_ = false;
+    reverted_.forgetSettled();
 
     //获取服务器语言
     const string sever_lang = getServer().getLanguage().getLocale();
@@ -488,6 +493,8 @@ void TianyanPlugin::onEnable()
 
     // 创建核心逻辑层
     tyCore = std::make_unique<TianyanCore>(*db_backend_);
+
+    restorePendingWrites();
 
     // 读取剩余配置
     //预先设置默认值
@@ -580,6 +587,7 @@ _____   _
             ordered_json cfg = read_config();
             wcfg.secret = cfg.value("web_secret", "your_secret");
             wcfg.port = cfg.value("web_port", 8098);
+            wcfg.host = cfg.value("web_host", std::string("127.0.0.1"));
 
             // 兼容旧版 web_config.json（Python 后端遗留）
             // 如果存在且插件 config.json 中尚未迁移，则优先读取
@@ -635,34 +643,30 @@ _____   _
 
 void TianyanPlugin::onDisable()
 {
-    inventoryui::shutdown();
-    getLogger().info("onDisable is called");
-
+    stopping_ = true;
+    getServer().getServiceManager().unregisterAll(*this);
     getServer().getScheduler().cancelTasks(*this);
-    logsCacheWrite();
-
-    // 清除剩余缓存
+    if (webui_server_) { webui_server_->stop(); webui_server_.reset(); }
     {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        logDataCache.clear();
+        std::lock_guard lock(async_tasks_mutex_);
+        for (auto& task : async_tasks_) if (task.cancel_flag) task.cancel_flag->store(true);
     }
-
-    if (TianyanCore::enable_web_ui)
-    {
-        // 停止 C++ WebUI 后端
-        if (webui_server_) {
-            webui_server_->stop();
-            webui_server_.reset();
-        }
-    }
-
-    // NOTE: tyCore 和 db_backend_ 由插件析构时自动销毁。
-    // 不可在此处手动 reset() —— logsCacheWrite 通过 detach() 线程异步访问它们，
-    // 手动 reset 会造成 use-after-free。
+    workers_.stop();
+    std::lock_guard backend_lock(backend_mutex_);
+    // Cleanup and migration have returned; no writer can race this final drain.
+    flushAcceptedLogs();
+    flushRevertStatuses();
+    savePendingWrites();
+    inventoryui::shutdown();
+    async_tasks_.clear();
+    async_offline_tasks_.clear();
+    is_db_over = false;
 }
 
 bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::Command &command, const std::vector<std::string> &args)
 {
+    if (stopping_) return false;
+    try {
     if (command.getName() == "ty")
     {
         // 菜单
@@ -715,6 +719,7 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
                     task.id = task_id;
                     task.type = AsyncQueryTask::Type::Ty;
                     task.player_name = sender.getName();
+                    task.session = sessions_[sender.getName()];
                     task.is_running = true;
                     task.hours = time;
                     task.r = r;
@@ -729,19 +734,23 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
 
                 sender.sendMessage(endstone::ColorFormat::Yellow + Tran->getLocal("Searching in the background, please wait"));
 
-                std::thread([this, task_id, cancel_flag, hours = time, r, world, x, y, z, key = search_key]() {
+                submitQueryWork(task_id, [this, task_id, cancel_flag, hours = time, r, world, x, y, z, key = search_key]() {
                     if (cancel_flag->load()) return;
                     auto results = tyCore->searchLog({key, hours}, x, y, z, r, world, cancel_flag.get());
                     if (cancel_flag->load()) return;
                     std::lock_guard lock(async_tasks_mutex_);
                     for (auto& t : async_tasks_) {
                         if (t.id == task_id) {
+                            if (t.type == AsyncQueryTask::Type::Tyback) {
+                                for (const auto& row : results) if (row.type == "block_place")
+                                    t.placed_positions.insert(std::to_string(row.pos_x) + "," + std::to_string(row.pos_y) + "," + std::to_string(row.pos_z));
+                            }
                             t.results = std::move(results);
                             t.is_complete = true;
                             break;
                         }
                     }
-                }).detach();
+                });
 
             } catch (const std::exception &e) {
                 sender.sendErrorMessage(e.what());
@@ -796,6 +805,7 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
                     task.cancel_flag = cancel_flag;
                     task.type = AsyncQueryTask::Type::Tyback;
                     task.player_name = sender.getName();
+                    task.session = sessions_[sender.getName()];
                     task.is_running = true;
                     task.hours = time;
                     task.r = r;
@@ -810,19 +820,23 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
 
                 sender.sendMessage(endstone::ColorFormat::Yellow + Tran->getLocal("Searching in the background, please wait"));
 
-                std::thread([this, task_id, cancel_flag, hours = time, r, world, x, y, z, key = source_key]() {
+                submitQueryWork(task_id, [this, task_id, cancel_flag, hours = time, r, world, x, y, z, key = source_key]() {
                     if (cancel_flag->load()) return;
                     auto results = tyCore->searchLog({key, hours}, x, y, z, r, world, cancel_flag.get());
                     if (cancel_flag->load()) return;
                     std::lock_guard lock(async_tasks_mutex_);
                     for (auto& t : async_tasks_) {
                         if (t.id == task_id) {
+                            if (t.type == AsyncQueryTask::Type::Tyback) {
+                                for (const auto& row : results) if (row.type == "block_place")
+                                    t.placed_positions.insert(std::to_string(row.pos_x) + "," + std::to_string(row.pos_y) + "," + std::to_string(row.pos_z));
+                            }
                             t.results = std::move(results);
                             t.is_complete = true;
                             break;
                         }
                     }
-                }).detach();
+                });
 
             } catch (const std::exception &e) {
                 sender.sendErrorMessage(e.what());
@@ -868,6 +882,7 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
                         task.cancel_flag = cancel_flag;
                         task.type = AsyncQueryTask::Type::Tys;
                         task.player_name = sender.getName();
+                    task.session = sessions_[sender.getName()];
                         task.is_running = true;
                         task.hours = time;
                         task.key_type = search_key_type;
@@ -877,19 +892,23 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
 
                     sender.sendMessage(endstone::ColorFormat::Yellow + Tran->getLocal("Searching in the background, please wait"));
 
-                    std::thread([this, task_id, cancel_flag, hours = time, key = search_key]() {
+                    submitQueryWork(task_id, [this, task_id, cancel_flag, hours = time, key = search_key]() {
                         if (cancel_flag->load()) return;
                         auto results = tyCore->searchLog({key, hours}, cancel_flag.get());
                         if (cancel_flag->load()) return;
                         std::lock_guard lock(async_tasks_mutex_);
                         for (auto& t : async_tasks_) {
                             if (t.id == task_id) {
-                                t.results = std::move(results);
+                                if (t.type == AsyncQueryTask::Type::Tyback) {
+                                for (const auto& row : results) if (row.type == "block_place")
+                                    t.placed_positions.insert(std::to_string(row.pos_x) + "," + std::to_string(row.pos_y) + "," + std::to_string(row.pos_z));
+                            }
+                            t.results = std::move(results);
                                 t.is_complete = true;
                                 break;
                             }
                         }
-                    }).detach();
+                    });
                 }
 
             } catch (const std::exception &e) {
@@ -946,16 +965,17 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
     }
     else if (command.getName() == "tyclean") {
         if (!args.empty()) {
-            if (yuhangle::clean_data_status == 2) {
+            if (yuhangle::clean_data_status != 0 || yuhangle::migrate_status != 0) {
                 sender.sendErrorMessage(Tran->getLocal("A background operation is in progress. Please wait for it to complete"));
                 return false;
             }
             int hours = db_util::stringToInt(args[0]);
             sender.sendMessage(endstone::ColorFormat::Yellow+Tran->tr(Tran->getLocal("Start cleaning logs older than {} hours"), args[0]));
-            std::thread clean_thread([this, hours, sender_name = sender.getName()]() {
+            yuhangle::clean_data_status = 2;
+            try { submitWork([this, hours, sender_name = sender.getName()]() {
                 runCleanup(hours, sender_name);
-            });
-            clean_thread.detach();
+            }); } catch (...) { yuhangle::clean_data_status = 0; throw; }
+
         }
     }
     else if (command.getName() == "tyo") {
@@ -986,34 +1006,27 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
                     task.player_uuid = *uuid;
                     task.world_path = OfflineInventoryReader::resolveWorldPath(getServerRoot());
                     task.is_running = true;
-                    size_t task_idx;
+                    task.id = next_task_id_++;
+                    task.session = sessions_[sender.getName()];
+                    const auto task_id = task.id;
+                    const auto world_path = task.world_path, player_uuid = task.player_uuid;
                     {
                         std::lock_guard lock(async_offline_mutex_);
                         async_offline_tasks_.push_back(std::move(task));
-                        task_idx = async_offline_tasks_.size() - 1;
                     }
-                    std::thread t([this, task_idx]() {
-                        std::string w_path, p_key;
-                        {
-                            std::lock_guard lock(async_offline_mutex_);
-                            if (task_idx >= async_offline_tasks_.size()) return;
-                            w_path = async_offline_tasks_[task_idx].world_path;
-                            p_key = async_offline_tasks_[task_idx].player_uuid;
-                        }
-                        auto* json = wi_get_inventory_json(w_path.c_str(), p_key.c_str());
-                        {
-                            std::lock_guard lock(async_offline_mutex_);
-                            if (task_idx < async_offline_tasks_.size()) {
-                                if (json) {
-                                    async_offline_tasks_[task_idx].result_json = json;
-                                    wi_free_string(json);
-                                }
-                                async_offline_tasks_[task_idx].is_running = false;
-                                async_offline_tasks_[task_idx].is_complete = true;
-                            }
+                    submitOfflineWork(task_id, [this, task_id, world_path, player_uuid]() {
+                        std::shared_ptr<WiEncodedInventory> encoded(
+                            wi_get_encoded_inventory(world_path.c_str(), player_uuid.c_str()),
+                            wi_free_encoded_inventory);
+                        std::lock_guard lock(async_offline_mutex_);
+                        for (auto& pending : async_offline_tasks_) {
+                            if (pending.id != task_id) continue;
+                            pending.encoded = std::move(encoded);
+                            pending.is_running = false;
+                            pending.is_complete = true;
+                            break;
                         }
                     });
-                    t.detach();
                     sender.sendMessage(endstone::ColorFormat::Yellow + Tran->getLocal("Querying offline inventory..."));
                 }
             }
@@ -1068,7 +1081,7 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
             sender.sendErrorMessage("Source and target must be different");
             return false;
         }
-        if (yuhangle::migrate_status == 1) {
+        if (yuhangle::migrate_status != 0) {
             sender.sendErrorMessage(Tran->getLocal("A migration is already in progress"));
             return false;
         }
@@ -1080,6 +1093,10 @@ bool TianyanPlugin::onCommand(endstone::CommandSender &sender, const endstone::C
         runMigration(src, dst, sender.getName());
     }
     return true;
+    } catch (const std::exception& e) {
+        sender.sendErrorMessage(std::string("操作无法提交：") + e.what());
+        return false;
+    }
 }
 
 void TianyanPlugin::runMigration(const std::string& source, const std::string& target, const std::string& sender_name) const
@@ -1094,9 +1111,11 @@ void TianyanPlugin::runMigration(const std::string& source, const std::string& t
     yuhangle::migrate_target_type = target;
     yuhangle::migrate_sender_name = sender_name;
 
-    std::thread migrate_thread([this, source, target]() {
+    try { submitWork([this, source, target]() {
         namespace fs1 = std::filesystem;
         try {
+            flushAcceptedLogs();
+            flushRevertStatuses();
             // Build source and target backends
             std::unique_ptr<IDatabaseBackend> src_backend;
             std::unique_ptr<IDatabaseBackend> dst_backend;
@@ -1286,15 +1305,18 @@ void TianyanPlugin::runMigration(const std::string& source, const std::string& t
         } catch (const std::exception& e) {
             yuhangle::migrate_message = {"Migration error: " + std::string(e.what())};
             yuhangle::migrate_status = -1;
+        } catch (...) {
+            yuhangle::migrate_message = {"Unknown migration failure"};
+            yuhangle::migrate_status = -1;
         }
-    });
-    migrate_thread.detach();
+    }); } catch (...) { yuhangle::migrate_status = 0; throw; }
+
 }
 
 void TianyanPlugin::checkMigrateStatus()
 {
     namespace fs = std::filesystem;
-    if (yuhangle::migrate_status == 0) return;
+    if (yuhangle::migrate_status == 0 || yuhangle::migrate_status == 1) return;
 
     const auto player = getServer().getPlayer(yuhangle::migrate_sender_name);
     const auto green = endstone::ColorFormat::Green;
@@ -1322,25 +1344,38 @@ void TianyanPlugin::checkMigrateStatus()
         if (need_swap) {
             getLogger().info(Tran->tr(Tran->getLocal("Switching active database backend to {}"), yuhangle::migrate_target_type));
 
-            // Suspend writes
-            is_db_over = false;
-
-            // Recreate core with the new backend type
-            if (yuhangle::migrate_target_type == "sqlite") {
-                const fs::path fullPath = fs::current_path() / TianyanCore::dbPath;
-                db_backend_ = std::make_unique<SqliteBackend>(fullPath.string());
-                db_backend_->init_database();
-            } else {
-                json cfg = read_config();
-                RustMySQLConfig mysql_cfg;
-                mysql_cfg.host = cfg.value("mysql_host", std::string("127.0.0.1"));
-                mysql_cfg.port = cfg.value("mysql_port", 3306);
-                mysql_cfg.user = cfg.value("mysql_user", std::string("root"));
-                mysql_cfg.password = cfg.value("mysql_password", std::string(""));
-                mysql_cfg.database = cfg.value("mysql_database", std::string("endstone"));
-                db_backend_ = std::make_unique<RustBackend>(mysql_cfg);
+            // Construct and validate before touching the current generation.
+            std::unique_ptr<IDatabaseBackend> candidate;
+            std::unique_ptr<TianyanCore> next_core;
+            std::unique_ptr<LogQueryImpl> next_query;
+            try {
+                if (yuhangle::migrate_target_type == "sqlite") {
+                    candidate = std::make_unique<SqliteBackend>((fs::current_path() / TianyanCore::dbPath).string());
+                } else {
+                    auto cfg = read_config();
+                    RustMySQLConfig mysql_cfg;
+                    mysql_cfg.host = cfg.value("mysql_host", std::string("127.0.0.1"));
+                    mysql_cfg.port = cfg.value("mysql_port", 3306);
+                    mysql_cfg.user = cfg.value("mysql_user", std::string("root"));
+                    mysql_cfg.password = cfg.value("mysql_password", std::string(""));
+                    mysql_cfg.database = cfg.value("mysql_database", std::string("endstone"));
+                    candidate = std::make_unique<RustBackend>(mysql_cfg);
+                }
+                if (candidate->init_database() != 0) throw std::runtime_error("New backend initialization failed");
+                next_core = std::make_unique<TianyanCore>(*candidate);
+                next_query = std::make_unique<LogQueryImpl>(*candidate);
+            } catch (const std::exception& e) {
+                getLogger().error("Backend switch failed; retaining active backend: {}", e.what());
+                yuhangle::migrate_status = 0;
+                return;
             }
-
+            workers_.waitIdle();
+            std::lock_guard backend_lock(backend_mutex_);
+            if (webui_server_) webui_server_->stop();
+            is_db_over = false;
+            tyCore.swap(next_core);
+            db_backend_.swap(candidate);
+            if (webui_server_) webui_server_->setLogQueryService(std::move(next_query));
             // Update db_type string for next server start
             db_type_ = yuhangle::migrate_target_type;
 
@@ -1359,7 +1394,6 @@ void TianyanPlugin::checkMigrateStatus()
             }
 
             // Rebuild core with new backend
-            tyCore = std::make_unique<TianyanCore>(*db_backend_);
             is_db_over = true;
             getLogger().info(Tran->tr(Tran->getLocal("Active backend switched to {}"), yuhangle::migrate_target_type));
 
@@ -1390,40 +1424,70 @@ void TianyanPlugin::checkMigrateStatus()
 }
 
     //缓存写入机制
-void TianyanPlugin::logsCacheWrite() const
-{
-    if (logDataCache.empty()) {
-        return;
-    }
-    //避开数据清理
-    if (yuhangle::clean_data_status == 2) {
-        return;
-    }
-    // 创建局部副本以避免在写入过程中数据被修改
-    std::vector<TianyanCore::LogData> localCache;
-
-    // 将当前缓存数据复制到局部变量中
-    {
-        std::lock_guard lock(cacheMutex);  // 互斥锁
-        localCache.swap(logDataCache);
-    }
-
-    // 异步写入
-    std::thread logsCacheWrite_thread ([this,localCache]() mutable {
-        // 检查写入状态
-        if (tyCore->recordLogs(localCache)) {
-            //超过100万仍无法写入，则清空缓存
-            if (localCache.size() > 1000000) {
-                std::cerr << "Unable to write a large volume of logs; cached logs will be discarded" << endl;
-                localCache.clear();
-            } else {
-                //将写入失败的数据放回去
-                std::lock_guard lock(cacheMutex);
-                logDataCache.insert(logDataCache.begin(), localCache.begin(), localCache.end());
+void TianyanPlugin::submitQueryWork(uint64_t id, std::function<void()> work) {
+    try {
+        submitWork([this, id, work = std::move(work)] {
+            try { work(); }
+            catch (...) {
+                std::lock_guard lock(async_tasks_mutex_);
+                for (auto& task : async_tasks_) if (task.id == id) {
+                    task.error = "Database query failed";
+                    task.is_complete = true;
+                    break;
+                }
+                getLogger().error("Database query failed for request {}", id);
             }
-        }
+        });
+    } catch (...) {
+        std::lock_guard lock(async_tasks_mutex_);
+        std::erase_if(async_tasks_, [id](const auto& task) { return task.id == id; });
+        throw;
+    }
+}
+
+void TianyanPlugin::submitOfflineWork(uint64_t id, std::function<void()> work) {
+    try {
+        submitWork([this, id, work = std::move(work)] {
+            try { work(); }
+            catch (...) {
+                std::lock_guard lock(async_offline_mutex_);
+                for (auto& task : async_offline_tasks_) if (task.id == id) {
+                    task.is_running = false; task.is_complete = true; break;
+                }
+                getLogger().error("Offline inventory read failed for request {}", id);
+            }
+        });
+    } catch (...) {
+        std::lock_guard lock(async_offline_mutex_);
+        std::erase_if(async_offline_tasks_, [id](const auto& task) { return task.id == id; });
+        throw;
+    }
+}
+
+void TianyanPlugin::submitWork(std::function<void()> task) const {
+    workers_.submit([this, task = std::move(task)] {
+        std::lock_guard lock(backend_mutex_);
+        try { task(); }
+        catch (const std::exception& e) { getLogger().error("Background operation failed: {}", e.what()); }
     });
-    logsCacheWrite_thread.detach();
+}
+
+void TianyanPlugin::logsCacheWrite() const {
+    if (stopping_) return;
+    try { submitWork([this] { if (yuhangle::migrate_status == 0) { flushAcceptedLogs(); flushRevertStatuses(); } }); }
+    catch (const std::exception& e) { getLogger().error("Log flush deferred: {}", e.what()); }
+}
+
+void TianyanPlugin::flushAcceptedLogs() const {
+    std::vector<TianyanCore::LogData> batch;
+    { std::lock_guard lock(cacheMutex); batch.swap(logDataCache); }
+    if (batch.empty()) return;
+    try {
+        if (tyCore && tyCore->recordLogs(batch) == 0) return;
+    } catch (const std::exception& e) { getLogger().error("Log flush failed: {}", e.what()); }
+    catch (...) { getLogger().error("Unknown log flush failure"); }
+    std::lock_guard lock(cacheMutex);
+    logDataCache.insert(logDataCache.begin(), std::make_move_iterator(batch.begin()), std::make_move_iterator(batch.end()));
 }
 
 void TianyanPlugin::runCleanup(const double hours, const std::string& sender_name) const
@@ -1444,8 +1508,8 @@ void TianyanPlugin::runCleanup(const double hours, const std::string& sender_nam
         // 统计待删除行数
         const int64_t to_delete = db_backend_->getCleanCount(threshold);
         if (to_delete < 0) {
-            yuhangle::clean_data_status = -1;
             yuhangle::clean_data_message = {"Failed to count rows for cleanup"};
+            yuhangle::clean_data_status = -1;
             return;
         }
         if (to_delete == 0) {
@@ -1461,8 +1525,8 @@ void TianyanPlugin::runCleanup(const double hours, const std::string& sender_nam
         if (!db_backend_->isSqlite()) {
             const int64_t kept = db_backend_->cleanupByRebuild(threshold);
             if (kept < 0) {
-                yuhangle::clean_data_status = -1;
                 yuhangle::clean_data_message = {"MySQL rebuild cleanup failed"};
+                yuhangle::clean_data_status = -1;
                 return;
             }
             const auto end_time = std::chrono::high_resolution_clock::now();
@@ -1478,8 +1542,8 @@ void TianyanPlugin::runCleanup(const double hours, const std::string& sender_nam
 
         // SQLite 模式：独立连接 + 分批 DELETE
         if (!db_backend_->beginCleanup()) {
-            yuhangle::clean_data_status = -1;
             yuhangle::clean_data_message = {"Failed to open cleanup connection"};
+            yuhangle::clean_data_status = -1;
             return;
         }
 
@@ -1489,10 +1553,11 @@ void TianyanPlugin::runCleanup(const double hours, const std::string& sender_nam
         while (total_deleted < to_delete) {
             const int deleted = db_backend_->cleanupDeleteBatch(threshold, CLEANUP_BATCH_SIZE);
             if (deleted < 0) {
-                yuhangle::clean_data_status = -1;
+                db_backend_->abortCleanup();
                 yuhangle::clean_data_message = {
                     "Batch delete failed after deleting " +
                     std::to_string(total_deleted) + " rows"};
+                yuhangle::clean_data_status = -1;
                 return;
             }
             if (deleted == 0) break;
@@ -1506,6 +1571,8 @@ void TianyanPlugin::runCleanup(const double hours, const std::string& sender_nam
             }
         }
 
+        // Always release the dedicated cleanup connection, including zero rows.
+        if (total_deleted == 0) db_backend_->abortCleanup();
         // 结束清理（VACUUM 或只 checkpoint）
         if (total_deleted > 0) {
             if (total_deleted >= 100000) {
@@ -1527,15 +1594,19 @@ void TianyanPlugin::runCleanup(const double hours, const std::string& sender_nam
         yuhangle::clean_data_status = 1;
 
     } catch (const std::exception& e) {
-        yuhangle::clean_data_status = -1;
         yuhangle::clean_data_message = {"Cleanup exception: " + std::string(e.what())};
+        yuhangle::clean_data_status = -1;
+    } catch (...) {
+        db_backend_->abortCleanup();
+        yuhangle::clean_data_message = {"Unknown cleanup failure"};
+        yuhangle::clean_data_status = -1;
     }
 }
 
 //检查异步的数据库清理状态
 void TianyanPlugin::checkDatabaseCleanStatus() const {
     const int status = yuhangle::clean_data_status.load();
-    if (status == 0) return;
+    if (status == 0 || status == 2) return;
 
     const auto player = getServer().getPlayer(yuhangle::clean_data_sender_name);
     const auto green = endstone::ColorFormat::Green;
@@ -1585,6 +1656,7 @@ void TianyanPlugin::checkDatabaseCleanStatus() const {
 
 //检查后台查询任务
 void TianyanPlugin::checkAsyncTasks() {
+    size_t rollback_budget = 100;
     // 收集已完成的任务
     vector<AsyncQueryTask> completed;
     {
@@ -1618,21 +1690,22 @@ void TianyanPlugin::checkAsyncTasks() {
     }
     for (auto& task : offline_completed) {
         const auto player = getServer().getPlayer(task.sender_name);
-        if (!player) continue;
+        if (!player || sessions_[task.sender_name] != task.session) continue;
 
-        if (task.result_json.empty()) {
+        if (!task.encoded) {
             player->sendErrorMessage(Tran->tr(Tran->getLocal("Player {} not found (offline)"), task.target_name));
             continue;
         }
 
-        menu_->showOfflinePlayerInventoryEncoded(*player, task.target_name, task.world_path, task.player_uuid);
+        menu_->showOfflinePlayerInventoryEncoded(*player, task.target_name, task.encoded.get());
     }
 
     // 处理其他后台查询任务
     for (auto& task : completed) {
         const auto player = getServer().getPlayer(task.player_name);
-        if (!player) continue;
+        if (!player || sessions_[task.player_name] != task.session) continue;
 
+        if (!task.error.empty()) { player->sendErrorMessage("查询失败，请检查服务端日志。"); continue; }
         if (task.type == AsyncQueryTask::Type::Ty || task.type == AsyncQueryTask::Type::Tys) {
             if (task.results.empty()) {
                 player->sendErrorMessage(Tran->getLocal("No log found"));
@@ -1679,21 +1752,24 @@ void TianyanPlugin::checkAsyncTasks() {
                 continue;
             }
 
-            int success_times = 0;
-            int failed_times = 0;
+            if (!player->hasPermission("ty.command.op")) {
+                player->sendErrorMessage("回溯已取消：权限已改变。");
+                continue;
+            }
+            if (player->getLocation().getDimension().getName() != task.world) {
+                player->sendErrorMessage("回溯已取消：玩家维度已改变。");
+                continue;
+            }
+            auto& success_times = task.successes;
+            auto& failed_times = task.failures;
 
             // 收集 block_place 的位置，跳过该位置上冗余的 player_right_click_block
-            std::unordered_set<std::string> placed_positions;
-            for (const auto& ld : task.results) {
-                if (ld.type == "block_place") {
-                    placed_positions.insert(std::to_string(ld.pos_x) + "," +
-                                            std::to_string(ld.pos_y) + "," +
-                                            std::to_string(ld.pos_z));
-                }
-            }
-
+            auto& placed_positions = task.placed_positions;
             // searchLog 按时间倒序返回（新→旧），回溯保持新→旧执行
-            for (auto& logData : task.results) {
+            while (task.cursor < task.results.size() && rollback_budget > 0) {
+                --rollback_budget;
+                auto& logData = task.results[task.cursor++];
+                if (logData.world != task.world || reverted_.contains(logData.uuid)) continue;
                 if (logData.status == "canceled" || logData.status == "reverted") {
                     continue;
                 }
@@ -1710,16 +1786,18 @@ void TianyanPlugin::checkAsyncTasks() {
                     if (task.key_type == "target_name" && logData.obj_name != task.key) continue;
                     if (task.key_type == "action" && logData.type != task.key) continue;
                 }
+                bool command_error = false;
                 endstone::CommandSenderWrapper wrapper_sender(*player,
                     [](const endstone::Message&) {},
-                    [](const endstone::Message&) {}
+                    [&command_error](const endstone::Message&) { command_error = true; }
                 );
                 if (logData.type == "block_break" || logData.type == "block_break_bomb" || (logData.type == "actor_bomb" && logData.id == "minecraft:tnt")) {
                     string pos = std::to_string(logData.pos_x) + " " + std::to_string(logData.pos_y) + " " + std::to_string(logData.pos_z);
                     std::ostringstream cmd;
                     cmd << "setblock " << pos << " " << logData.obj_id << logData.data;
-                    if (getServer().dispatchCommand(wrapper_sender, cmd.str())) {
-                        TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted");
+                    if (getServer().dispatchCommand(wrapper_sender, cmd.str()) && !command_error) {
+                        reverted_.record(logData.uuid);
+                        { std::lock_guard lock(cacheMutex); TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted"); }
                         success_times++;
                     } else {
                         failed_times++;
@@ -1740,8 +1818,9 @@ void TianyanPlugin::checkAsyncTasks() {
                         string pos = std::to_string(logData.pos_x) + " " + std::to_string(logData.pos_y) + " " + std::to_string(logData.pos_z);
                         std::ostringstream cmd;
                         cmd << "setblock " << pos << " " << logData.obj_id << hand_block[1];
-                        if (getServer().dispatchCommand(wrapper_sender, cmd.str())) {
-                            TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted");
+                        if (getServer().dispatchCommand(wrapper_sender, cmd.str()) && !command_error) {
+                            reverted_.record(logData.uuid);
+                        { std::lock_guard lock(cacheMutex); TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted"); }
                             success_times++;
                         } else {
                             failed_times++;
@@ -1751,8 +1830,9 @@ void TianyanPlugin::checkAsyncTasks() {
                     string pos = std::to_string(logData.pos_x) + " " + std::to_string(logData.pos_y) + " " + std::to_string(logData.pos_z);
                     std::ostringstream cmd;
                     cmd << "setblock " << pos << " minecraft:air";
-                    if (getServer().dispatchCommand(wrapper_sender, cmd.str())) {
-                        TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted");
+                    if (getServer().dispatchCommand(wrapper_sender, cmd.str()) && !command_error) {
+                        reverted_.record(logData.uuid);
+                        { std::lock_guard lock(cacheMutex); TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted"); }
                         success_times++;
                     } else {
                         failed_times++;
@@ -1768,8 +1848,9 @@ void TianyanPlugin::checkAsyncTasks() {
                     }
                     std::ostringstream cmd;
                     cmd << "summon " << obj_id << " " << pos;
-                    if (getServer().dispatchCommand(wrapper_sender, cmd.str())) {
-                        TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted");
+                    if (getServer().dispatchCommand(wrapper_sender, cmd.str()) && !command_error) {
+                        reverted_.record(logData.uuid);
+                        { std::lock_guard lock(cacheMutex); TianyanCore::revertStatusCache.emplace_back(logData.uuid, "reverted"); }
                         success_times++;
                     } else {
                         failed_times++;
@@ -1777,6 +1858,11 @@ void TianyanPlugin::checkAsyncTasks() {
                 }
             }
             updateRevertStatus();
+            if (task.cursor < task.results.size()) {
+                std::lock_guard lock(async_tasks_mutex_);
+                async_tasks_.push_back(std::move(task));
+                continue;
+            }
             if (success_times > 0) {
                 player->sendMessage(endstone::ColorFormat::Green + Tran->getLocal("Revert times: ") + std::to_string(success_times + failed_times));
                 player->sendMessage(endstone::ColorFormat::Green + Tran->getLocal("Success: ") + std::to_string(success_times));
@@ -1787,35 +1873,95 @@ void TianyanPlugin::checkAsyncTasks() {
             }
         }
     }
+    {
+        std::lock_guard lock(async_tasks_mutex_);
+        if (std::none_of(async_tasks_.begin(), async_tasks_.end(), [](const auto& task) { return task.type == AsyncQueryTask::Type::Tyback; }))
+            reverted_.forgetSettled();
+    }
 }
 
 // 批量更新回溯状态
-void TianyanPlugin::updateRevertStatus() const
-{
-    if (TianyanCore::revertStatusCache.empty()) {
-        return;
-    }
-    if (yuhangle::clean_data_status == 2) {
-        return;
-    }
-    vector<pair<string, string>> localCache;
-    {
-        std::lock_guard lock(cacheMutex);  // 互斥锁
-        localCache.swap(TianyanCore::revertStatusCache);
-    }
-    //异步写入
-    std::thread updateRevertStatus_thread ([this,localCache]()mutable {
-        if (!db_backend_->updateStatusesByUUIDs(localCache)) {
-            std::cerr << "Update revert status failed" << std::endl;
-            if (localCache.size() > 1000000) {
-                std::cerr << "Unable to write a large volume of logs; cached logs will be discarded" << endl;
-                localCache.clear();
-            } else {
-                TianyanCore::revertStatusCache.insert(TianyanCore::revertStatusCache.begin(), localCache.begin(), localCache.end());
-            }
+void TianyanPlugin::updateRevertStatus() const {
+    if (stopping_) return;
+    try { submitWork([this] { if (yuhangle::migrate_status == 0) flushRevertStatuses(); }); }
+    catch (const std::exception& e) { getLogger().error("Status flush deferred: {}", e.what()); }
+}
+
+void TianyanPlugin::flushRevertStatuses() const {
+    vector<pair<string, string>> batch;
+    { std::lock_guard lock(cacheMutex); batch.swap(TianyanCore::revertStatusCache); }
+    if (batch.empty()) return;
+    try {
+        if (db_backend_ && db_backend_->updateStatusesByUUIDs(batch)) {
+            for (const auto& [uuid, status] : batch) reverted_.acknowledge(uuid);
+            return;
         }
-    });
-    updateRevertStatus_thread.detach();
+    }
+    catch (const std::exception& e) { getLogger().error("Status flush failed: {}", e.what()); }
+    catch (...) { getLogger().error("Unknown status flush failure"); }
+    std::lock_guard lock(cacheMutex);
+    TianyanCore::revertStatusCache.insert(TianyanCore::revertStatusCache.begin(), batch.begin(), batch.end());
+}
+
+void TianyanPlugin::savePendingWrites() const {
+    namespace fs = std::filesystem;
+    if (!recovery_loaded_) return; // Never overwrite an unreadable recovery file.
+    std::lock_guard lock(cacheMutex);
+    const auto path = std::filesystem::path(TianyanCore::dataPath) / "pending-writes.json";
+    try {
+        if (logDataCache.empty() && TianyanCore::revertStatusCache.empty()) {
+            fs::remove(path);
+            auto backup = path; backup += ".previous"; fs::remove(backup);
+            return;
+        }
+        json pending;
+        pending["logs"] = json::array();
+        for (const auto& row : logDataCache) pending["logs"].push_back({
+            row.uuid, row.id, row.name, row.pos_x, row.pos_y, row.pos_z, row.world,
+            row.obj_id, row.obj_name, row.time, row.type, row.data, row.status});
+        pending["statuses"] = TianyanCore::revertStatusCache;
+        auto temporary = path; temporary += ".tmp";
+        std::ofstream out(temporary, std::ios::trunc);
+        out << pending.dump(); out.flush();
+        if (!out) throw std::runtime_error("Unable to write recovery file");
+        out.close();
+#ifdef _WIN32
+        // Windows rename cannot replace; preserve previous recovery until new write is complete.
+        if (fs::exists(path)) {
+            auto backup = path; backup += ".previous";
+            fs::copy_file(path, backup, fs::copy_options::overwrite_existing);
+            fs::remove(path);
+        }
+#endif
+        fs::rename(temporary, path);
+        getLogger().warning("Retained {} logs and {} status updates for replay on next enable", logDataCache.size(), TianyanCore::revertStatusCache.size());
+        logDataCache.clear();
+        TianyanCore::revertStatusCache.clear();
+    } catch (const std::exception& e) {
+        getLogger().error("FINAL DRAIN FAILED: pending writes remain in memory; recovery file failed: {}", e.what());
+    }
+}
+
+void TianyanPlugin::restorePendingWrites() {
+    recovery_loaded_ = false;
+    namespace fs = std::filesystem;
+    auto path = std::filesystem::path(TianyanCore::dataPath) / "pending-writes.json";
+#ifdef _WIN32
+    if (!fs::exists(path)) { auto backup = path; backup += ".previous"; if (fs::exists(backup)) path = backup; }
+#endif
+    if (!fs::exists(path)) { recovery_loaded_ = true; return; }
+    std::ifstream in(path);
+    json pending; in >> pending;
+    std::vector<TianyanCore::LogData> rows;
+    for (const auto& a : pending.at("logs")) rows.push_back({
+        a.at(0), a.at(1), a.at(2), a.at(3), a.at(4), a.at(5), a.at(6),
+        a.at(7), a.at(8), a.at(9), a.at(10), a.at(11), a.at(12)});
+    auto statuses = pending.at("statuses").get<vector<pair<string, string>>>();
+    for (const auto& [uuid, status] : statuses) reverted_.record(uuid);
+    std::lock_guard lock(cacheMutex);
+    logDataCache.insert(logDataCache.end(), rows.begin(), rows.end());
+    TianyanCore::revertStatusCache.insert(TianyanCore::revertStatusCache.end(), statuses.begin(), statuses.end());
+    recovery_loaded_ = true;
 }
 
 // 专门用于注册期的翻译
@@ -1872,21 +2018,27 @@ std::vector<tianyan::LogData> TianyanPlugin::processLogConversion(std::vector<Ti
 // --- 同步版本实现 ---
 std::vector<tianyan::LogData> TianyanPlugin::getLogDataSync(double hours, const int limit) const
 {
-    if (!isCompatible()) return {};
+    if (stopping_ || !isCompatible()) return {};
+    std::lock_guard lock(backend_mutex_);
     auto searchData = tyCore->searchLog({"", hours});
     return processLogConversion(std::move(searchData), limit);
 }
 
 // --- 异步版本实现 ---
 std::future<std::vector<tianyan::LogData>> TianyanPlugin::getLogDataAsync(double hours) {
-    if (!isCompatible()) return {};
-    return std::async(std::launch::async, [this, hours]() {
+    if (stopping_ || !isCompatible()) return {};
+    auto task = std::make_shared<std::packaged_task<std::vector<tianyan::LogData>()>>([this, hours] {
         auto searchData = tyCore->searchLog({"", hours});
         return processLogConversion(std::move(searchData), -1);
     });
+    auto result = task->get_future();
+    submitWork([task] { (*task)(); });
+    return result;
 }
 
 std::vector<tianyan::LogData> TianyanPlugin::getLogDataSyncImpl(double seconds, const int limit) {
+    std::lock_guard lock(backend_mutex_);
+    if (stopping_) return {};
     auto searchData = tyCore->searchLog({"", seconds});
     return processLogConversion(std::move(searchData), limit);
 }

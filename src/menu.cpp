@@ -540,9 +540,8 @@ bool Menu::showOfflinePlayerInventoryUI(endstone::Player &sender, const std::str
 }
 
 bool Menu::showOfflinePlayerInventoryEncoded(endstone::Player &sender, const std::string& player_name,
-    const std::string& world_path, const std::string& player_uuid)
+    const WiEncodedInventory* encoded)
 {
-    auto* encoded = wi_get_encoded_inventory(world_path.c_str(), player_uuid.c_str());
     if (!encoded) {
         sender.sendErrorMessage(tran_->tr(tran_->getLocal("Player {} not found (offline)"), player_name));
         return false;
@@ -564,7 +563,7 @@ bool Menu::showOfflinePlayerInventoryEncoded(endstone::Player &sender, const std
                 inv->set_pre_encoded_item(slot, std::string(type_id), count, damage, nbt);
             }
 
-            wi_free_encoded_inventory(encoded);
+
 
             // 注册点击回调：复制物品到点击者背包
             menu->set_listener([this](const endstone::Player &clicker, int,
@@ -598,7 +597,7 @@ bool Menu::showOfflinePlayerInventoryEncoded(endstone::Player &sender, const std
         content += fmt::format("Slot {}: {} x{} (damage: {})\n",
             item.slot, item.type_id ? item.type_id : "?", item.count, item.damage);
     }
-    wi_free_encoded_inventory(encoded);
+
 
     if (content.empty()) {
         content = tran_->getLocal("Inventory is empty");

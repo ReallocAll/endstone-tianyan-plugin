@@ -65,6 +65,10 @@ public:
     // === 生命周期 ===
 
     bool start() {
+        if (config_.secret.find_first_not_of(" \t\r\n") == std::string::npos || config_.secret == "your_secret") {
+            std::cerr << "[WebUIServer] Configure a private web_secret before enabling WebUI.\n";
+            return false;
+        }
         if (running_) {
             std::cerr << "[WebUIServer] Already running.\n";
             return false;

@@ -1,16 +1,49 @@
-name: Nightly Build
+name: Build and Release
 
 on:
   push:
     branches:
       - master
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Prepared version (must match CMake and changelog)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Build and validate without publishing'
+        type: boolean
+        default: true
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate release metadata
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: python3 tools/release_metadata.py
+  regression:
+    uses: ./.github/workflows/ownership-tests.yml
   build:
+    needs: prepare
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -58,7 +91,7 @@ jobs:
       - name: Configure CMake (Linux)
         if: runner.os == 'Linux'
         run: |
-          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release \
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=1 \
                 -DCMAKE_C_COMPILER=clang-19 \
                 -DCMAKE_CXX_COMPILER=clang++-19 \
                 -DCMAKE_CXX_FLAGS="-stdlib=libc++"
@@ -92,7 +125,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release `
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=1 `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake" `
@@ -130,44 +163,67 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: nightly-plugin-${{ runner.os }}
-          path: tianyan_nightly_*.zip
+          path: |
+            tianyan_nightly_*.zip
+            build/endstone_tianyan.so
+            build/endstone_tianyan.dll
           retention-days: 1
 
-  # ===== Nightly Release =====
-  release:
-    name: Publish Nightly Release
-    needs: build
+
+  publish:
+    name: Publish GitHub Release
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, build, regression]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           pattern: nightly-plugin-*
           merge-multiple: true
           path: artifacts
-
-      - name: List artifacts
-        run: ls -la artifacts/
-
-      - name: Create nightly release
+      - name: Prepare current-run release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          DATE_TAG=$(date -u +'%Y-%m-%d')
-
-          # 删除已有的 nightly release 和远程 tag（忽略不存在的情况）
-          gh release delete nightly --yes 2>/dev/null || true
-          git push --delete origin nightly 2>/dev/null || true
-
-          # 创建新的 nightly release，指定目标 commit 防止本地残留 tag 冲突
-          gh release create nightly \
-            --title "Nightly Build $DATE_TAG" \
-            --notes "Auto-built from commit ${{ github.sha }} on $DATE_TAG" \
-            --target ${{ github.sha }} \
-            --prerelease \
-            artifacts/*
+          set -euo pipefail
+          mkdir release
+          cp artifacts/build/endstone_tianyan.so release/
+          cp artifacts/build/endstone_tianyan.dll release/
+          cp artifacts/tianyan_nightly_linux.zip "release/tianyan-$VERSION-linux.zip"
+          cp artifacts/tianyan_nightly_windows.zip "release/tianyan-$VERSION-windows.zip"
+          printf 'Source: %s\nBuild and regression run: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > release/PROVENANCE.txt
+          (cd release && sha256sum * > SHA256SUMS)
+          python3 - <<'PYNOTES'
+          import os
+          from pathlib import Path
+          text = Path('CHANGELOG.md').read_text()
+          start = text.index('## [' + os.environ['VERSION'] + ']')
+          start = text.index('\n', start) + 1
+          end = text.find('\n## [', start)
+          notes = (text[start:] if end < 0 else text[start:end]).strip()
+          if not notes: raise SystemExit('Empty release notes')
+          Path('/tmp/tianyan-release-notes.md').write_text(notes + '\n')
+          PYNOTES
+      - name: Tag and publish tested SHA without overwriting a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to overwrite'
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/v$VERSION"; then
+            test "$(git rev-list -n 1 "v$VERSION")" = "$GITHUB_SHA" || { echo 'Refusing to move existing tag'; exit 1; }
+          else
+            git tag "v$VERSION" "$GITHUB_SHA"
+            git push origin "refs/tags/v$VERSION"
+          fi
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Tianyan v$VERSION" --notes-file /tmp/tianyan-release-notes.md release/*

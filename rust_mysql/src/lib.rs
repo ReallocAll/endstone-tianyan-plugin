@@ -4,7 +4,7 @@ use std::ptr;
 use std::sync::Mutex;
 
 use mysql::prelude::*;
-use mysql::{OptsBuilder, Pool, Row, Value};
+use mysql::{OptsBuilder, Pool, Row, TxOpts, Value};
 
 // ============================================================
 // Internal types
@@ -152,6 +152,45 @@ fn collect_rows(
 
 type CancelCb = unsafe extern "C" fn(*mut c_void) -> bool;
 
+/// Owns every callback invocation. Dropping this guard wakes and joins the
+/// watcher before the borrowed C++ cancellation context may be destroyed.
+struct CancelWatcher {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CancelWatcher {
+    fn start(mut poll: impl FnMut() -> bool + Send + 'static) -> Result<Self, String> {
+        let (stop, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("tianyan-query-cancel".into())
+            .spawn(move || {
+                while matches!(
+                    rx.recv_timeout(std::time::Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if poll() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("cancel watcher: {}", e))?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for CancelWatcher {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Run a query with true cancellation support.
 ///
 /// Executes the query in the current thread, streaming rows one at a time
@@ -170,55 +209,34 @@ fn query_with_cancel(
     cancel_fn: Option<CancelCb>,
     cancel_ctx: *mut c_void,
 ) -> Result<OpaqueResult, String> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
     use std::time::Duration;
 
-    let is_cancelled = || -> bool {
-        cancel_fn.map_or(false, |cb| unsafe { cb(cancel_ctx) })
-    };
-
-    // Early check before any MySQL work
+    let is_cancelled = || -> bool { cancel_fn.map_or(false, |cb| unsafe { cb(cancel_ctx) }) };
     if is_cancelled() {
         return Err("Cancelled".to_string());
     }
 
     let mut conn = pool.get_conn().map_err(|e| format!("conn: {}", e))?;
-    let conn_id: u32 = conn.connection_id();
-
-    // Shared flag so the watcher thread knows when the query completes
-    let complete = Arc::new(AtomicBool::new(false));
-    let complete_watcher = Arc::clone(&complete);
-
-    // Watcher thread: if cancellation is requested while the main thread
-    // is blocked on MySQL I/O (exec_iter / next()), send KILL QUERY to
-    // the MySQL server to interrupt the query at the server level.
-    let kill_pool = pool.clone();
-    let kill_id = conn_id;
-    let watch_cancel = cancel_fn;
+    let conn_id = conn.connection_id();
+    // Keep the query's connection leased until the watcher has joined. Otherwise
+    // a late KILL QUERY could target another caller reusing that connection.
     let watch_ctx = cancel_ctx as usize;
-    std::thread::spawn(move || {
-        loop {
-            if complete_watcher.load(Ordering::Acquire) {
-                break; // Query completed normally — watcher exits
+    let _watcher = CancelWatcher::start(move || {
+        if cancel_fn.map_or(false, |cb| unsafe { cb(watch_ctx as *mut c_void) }) {
+            if let Ok(mut kill_conn) = pool.try_get_conn(Duration::from_secs(1)) {
+                let _ = kill_conn.exec_drop(format!("KILL QUERY {}", conn_id), ());
             }
-            std::thread::sleep(Duration::from_millis(100));
-            if watch_cancel.map_or(false, |cb| unsafe { cb(watch_ctx as *mut c_void) }) {
-                if let Ok(mut kill_conn) = kill_pool.get_conn() {
-                    let sql = format!("KILL QUERY {}", kill_id);
-                    let _ = kill_conn.exec_drop(sql, ());
-                }
-                break;
-            }
+            true
+        } else {
+            false
         }
-    });
+    })?;
 
     // Execute query — this may block if the query is complex.
     // The watcher thread can KILL QUERY to interrupt this.
     let mut result = match conn.exec_iter(&sql, params) {
         Ok(r) => r,
         Err(e) => {
-            complete.store(true, Ordering::Release);
             if is_cancelled() {
                 return Err("Cancelled".to_string());
             }
@@ -228,7 +246,6 @@ fn query_with_cancel(
 
     // One more check after query starts
     if is_cancelled() {
-        complete.store(true, Ordering::Release);
         return Err("Cancelled".to_string());
     }
 
@@ -250,7 +267,6 @@ fn query_with_cancel(
     // the entire result set into memory only to discard it.
     for row_res in result.by_ref() {
         if is_cancelled() {
-            complete.store(true, Ordering::Release);
             return Err("Cancelled".to_string());
         }
 
@@ -262,7 +278,6 @@ fn query_with_cancel(
         let row = match row_res {
             Ok(r) => r,
             Err(e) => {
-                complete.store(true, Ordering::Release);
                 if is_cancelled() {
                     // exec_iter was interrupted by KILL QUERY — expected
                     return Err("Cancelled".to_string());
@@ -280,7 +295,6 @@ fn query_with_cancel(
         rows.push(r);
     }
 
-    complete.store(true, Ordering::Release);
     Ok(OpaqueResult { cols, rows })
 }
 
@@ -331,7 +345,7 @@ pub extern "C" fn rust_mysql_connect(handle: *mut c_void) -> bool {
     if handle.is_null() {
         return false;
     }
-    let m = unsafe { &mut *(handle as *mut RustMySQL) };
+    let m = unsafe { &*(handle as *const RustMySQL) };
     match m.inner.lock() {
         Ok(mut g) => g.connect(),
         Err(_) => false,
@@ -343,7 +357,7 @@ pub extern "C" fn rust_mysql_disconnect(handle: *mut c_void) -> bool {
     if handle.is_null() {
         return false;
     }
-    let m = unsafe { &mut *(handle as *mut RustMySQL) };
+    let m = unsafe { &*(handle as *const RustMySQL) };
     match m.inner.lock() {
         Ok(mut g) => g.disconnect(),
         Err(_) => false,
@@ -368,7 +382,7 @@ pub extern "C" fn rust_mysql_is_connected(handle: *const c_void) -> bool {
 
 /// Extract a Pool from the handle. Returns Err on mutex poison.
 fn get_pool(handle: *mut c_void) -> Result<Pool, ()> {
-    let m = unsafe { &mut *(handle as *mut RustMySQL) };
+    let m = unsafe { &*(handle as *const RustMySQL) };
     match m.inner.lock() {
         Ok(mut g) => g.get_or_create_pool(),
         Err(e) => {
@@ -391,7 +405,7 @@ where
     match f(pool) {
         Ok(r) => r,
         Err(e) => {
-            let m = unsafe { &mut *(handle as *mut RustMySQL) };
+            let m = unsafe { &*(handle as *const RustMySQL) };
             if let Ok(mut guard) = m.inner.lock() {
                 guard.set_error(e);
             }
@@ -413,7 +427,7 @@ where
     match f(pool) {
         Ok(r) => r,
         Err(e) => {
-            let m = unsafe { &mut *(handle as *mut RustMySQL) };
+            let m = unsafe { &*(handle as *const RustMySQL) };
             if let Ok(mut guard) = m.inner.lock() {
                 guard.set_error(e);
             }
@@ -423,10 +437,7 @@ where
 }
 
 #[no_mangle]
-pub extern "C" fn rust_mysql_query(
-    handle: *mut c_void,
-    sql: *const c_char,
-) -> *mut c_void {
+pub extern "C" fn rust_mysql_query(handle: *mut c_void, sql: *const c_char) -> *mut c_void {
     if handle.is_null() || sql.is_null() {
         return ptr::null_mut();
     }
@@ -467,10 +478,7 @@ pub extern "C" fn rust_mysql_query_params(
 }
 
 #[no_mangle]
-pub extern "C" fn rust_mysql_execute(
-    handle: *mut c_void,
-    sql: *const c_char,
-) -> i64 {
+pub extern "C" fn rust_mysql_execute(handle: *mut c_void, sql: *const c_char) -> i64 {
     if handle.is_null() || sql.is_null() {
         return -1;
     }
@@ -505,6 +513,55 @@ pub extern "C" fn rust_mysql_execute_params(
     })
 }
 
+/// One statement in an atomic batch. All input buffers are borrowed only
+/// during the synchronous call; each statement executes on the SAME lease.
+#[repr(C)]
+pub struct BatchStatement {
+    sql: *const c_char,
+    params: *const *const c_char,
+    param_count: i32,
+}
+
+#[no_mangle]
+pub extern "C" fn rust_mysql_execute_batch(
+    handle: *mut c_void,
+    statements: *const BatchStatement,
+    count: i32,
+) -> i64 {
+    if handle.is_null() || count < 0 || (count > 0 && statements.is_null()) {
+        return -1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    let batch = unsafe { std::slice::from_raw_parts(statements, count as usize) };
+    if batch
+        .iter()
+        .any(|s| s.sql.is_null() || s.param_count < 0 || (s.param_count > 0 && s.params.is_null()))
+    {
+        return -1;
+    }
+    with_pool_i64(handle, |pool| {
+        let mut conn = pool.get_conn().map_err(|e| format!("conn: {}", e))?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(|e| format!("begin: {}", e))?;
+        let mut affected = 0_i64;
+        for statement in batch {
+            tx.exec_drop(
+                unsafe { cstr_to_str(statement.sql) },
+                make_params(statement.params, statement.param_count),
+            )
+            .map_err(|e| format!("batch: {}", e))?;
+            affected = affected.saturating_add(tx.affected_rows() as i64);
+        }
+        // Transaction's Drop rolls back on every earlier error; commit errors
+        // are returned, never reported to the caller as success.
+        tx.commit().map_err(|e| format!("commit: {}", e))?;
+        Ok(affected)
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn rust_mysql_query_params_with_cancel(
     handle: *mut c_void,
@@ -528,7 +585,7 @@ pub extern "C" fn rust_mysql_query_params_with_cancel(
     match query_with_cancel(pool, sql_str, values, cancel_fn, cancel_ctx) {
         Ok(opaque) => Box::into_raw(Box::new(opaque)) as *mut c_void,
         Err(e) => {
-            let m = unsafe { &mut *(handle as *mut RustMySQL) };
+            let m = unsafe { &*(handle as *const RustMySQL) };
             if let Ok(mut guard) = m.inner.lock() {
                 guard.set_error(e);
             }
@@ -560,10 +617,7 @@ pub extern "C" fn rust_mysql_result_cols(result: *const c_void) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn rust_mysql_result_col_name(
-    result: *const c_void,
-    col: i32,
-) -> *const c_char {
+pub extern "C" fn rust_mysql_result_col_name(result: *const c_void, col: i32) -> *const c_char {
     with_result(result, |r| {
         let idx = col as usize;
         if idx < r.cols.len() {
@@ -605,17 +659,19 @@ pub extern "C" fn rust_mysql_free_result(result: *mut c_void) {
 // ============================================================
 
 #[no_mangle]
-pub extern "C" fn rust_mysql_last_error(handle: *const c_void) -> *const c_char {
+/// Returns an owned copy; the caller must use rust_mysql_free_string.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn rust_mysql_last_error(handle: *const c_void) -> *mut c_char {
     if handle.is_null() {
-        return ptr::null();
+        return ptr::null_mut();
     }
     let m = unsafe { &*(handle as *const RustMySQL) };
     match m.inner.lock() {
         Ok(g) => match &g.last_error_cstr {
-            Some(cs) => cs.as_ptr(),
-            None => ptr::null(),
+            Some(cs) => cs.clone().into_raw(),
+            None => ptr::null_mut(),
         },
-        Err(_) => ptr::null(),
+        Err(_) => ptr::null_mut(),
     }
 }
 
@@ -635,5 +691,124 @@ pub extern "C" fn rust_mysql_free_string(s: *mut c_char) {
         unsafe {
             drop(CString::from_raw(s));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn watcher_drop_joins_an_inflight_callback() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let watcher = CancelWatcher::start(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            flag.store(true, Ordering::Release);
+            true
+        })
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(watcher);
+            dropped_tx.send(()).unwrap();
+        });
+        assert!(dropped_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        release_tx.send(()).unwrap();
+        dropped_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        dropper.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watcher_stop_does_not_poll_borrowed_context_after_return() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p = polls.clone();
+        let watcher = CancelWatcher::start(move || {
+            p.fetch_add(1, Ordering::Relaxed);
+            false
+        })
+        .unwrap();
+        drop(watcher);
+        let count = polls.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(polls.load(Ordering::Relaxed), count);
+    }
+
+    #[test]
+    fn error_copy_survives_replacement_and_handle_destruction() {
+        let handle = Box::into_raw(Box::new(RustMySQL {
+            inner: Mutex::new(RustMySQLInner {
+                pool: None,
+                opts: OptsBuilder::new(),
+                last_error_cstr: Some(CString::new("first error").unwrap()),
+            }),
+        })) as *mut c_void;
+        let first = rust_mysql_last_error(handle);
+        let m = unsafe { &*(handle as *const RustMySQL) };
+        m.inner.lock().unwrap().set_error("new error".into());
+        rust_mysql_free(handle);
+        assert_eq!(
+            unsafe { CStr::from_ptr(first) }.to_str().unwrap(),
+            "first error"
+        );
+        rust_mysql_free_string(first);
+    }
+
+    #[test]
+    #[ignore = "requires isolated MySQL with TIANYAN_MYSQL_TEST_URL"]
+    fn mysql_batch_rolls_back_and_commits_on_one_connection() {
+        let url = std::env::var("TIANYAN_MYSQL_TEST_URL").expect("isolated test database URL");
+        let opts = OptsBuilder::from_opts(mysql::Opts::from_url(&url).unwrap());
+        let pool = Pool::new(opts.clone()).unwrap();
+        let handle = Box::into_raw(Box::new(RustMySQL {
+            inner: Mutex::new(RustMySQLInner {
+                pool: Some(pool.clone()),
+                opts,
+                last_error_cstr: None,
+            }),
+        })) as *mut c_void;
+        let table = format!("batch_test_{}", uuid::Uuid::new_v4().simple());
+        let mut conn = pool.get_conn().unwrap();
+        conn.query_drop(format!(
+            "CREATE TABLE {} (id INT PRIMARY KEY) ENGINE=InnoDB",
+            table
+        ))
+        .unwrap();
+        let insert = CString::new(format!("INSERT INTO {} VALUES (?)", table)).unwrap();
+        let value = CString::new("1").unwrap();
+        let params = [value.as_ptr()];
+        let statements = [
+            BatchStatement {
+                sql: insert.as_ptr(),
+                params: params.as_ptr(),
+                param_count: 1,
+            },
+            BatchStatement {
+                sql: insert.as_ptr(),
+                params: params.as_ptr(),
+                param_count: 1,
+            },
+        ];
+        // A duplicate key in the second statement must roll back the first.
+        assert_eq!(rust_mysql_execute_batch(handle, statements.as_ptr(), 2), -1);
+        let count: Option<u64> = conn
+            .query_first(format!("SELECT COUNT(*) FROM {}", table))
+            .unwrap();
+        assert_eq!(count, Some(0));
+        assert_eq!(rust_mysql_execute_batch(handle, statements.as_ptr(), 1), 1);
+        let count: Option<u64> = conn
+            .query_first(format!("SELECT COUNT(*) FROM {}", table))
+            .unwrap();
+        assert_eq!(count, Some(1));
+        conn.query_drop(format!("DROP TABLE {}", table)).unwrap();
+        rust_mysql_free(handle);
     }
 }
